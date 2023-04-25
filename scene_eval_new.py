@@ -2,6 +2,7 @@ import os
 import json
 import tqdm
 import glob
+import time
 import numpy
 import torch
 import open3d
@@ -11,11 +12,16 @@ import trimesh.registration
 import scipy.spatial as ssp
 import scipy.optimize as sopt
 import matplotlib.pyplot as plotlib
+from collections import defaultdict
 from sklearn.neighbors import KDTree
 from sklearn.decomposition import PCA
 from train_ppf import validation, simplify
 from itertools import permutations, product
 from models.model import PPFEncoder, PointEncoder
+from utils.util import compute_ap_from_matches_scores, iou_3d_aabb
+
+
+result_fn = 'eval_new_%d.txt' % int(time.time())
 
 
 def estimate_normals(pc):
@@ -212,7 +218,7 @@ def registration(pc, pc_ref, return_iou=False):
         return max_res
 
 
-def run_scene(obj_name, scene, anno):
+def run_scene(obj_name, scene):
     ckpt = torch.load(f'ckpt/{obj_name}.pt')
     point_encoder.load_state_dict(ckpt['pe'])
     ppf_encoder.load_state_dict(ckpt['ppf'])
@@ -228,69 +234,156 @@ def run_scene(obj_name, scene, anno):
     preds, cands = predict(obj_pts, rad_scale)
     clean_err = numpy.linalg.norm(cands[0])
     # print("Clean:", clean_err)
-    low = numpy.percentile(preds, 1, axis=0)
-    high = numpy.percentile(preds, 99, axis=0)
     xyz = numpy.load(scene).astype(numpy.float32)[:, [0, 2, 1]]
-    # xyz = numpy.load(r'synthscn.npz')['xyz'].astype(numpy.float32)
-    # xyz = obj_pts
     _, cands = predict(
         xyz, rad_scale,
         # lambda preds: ((preds > preds.new_tensor(low)) & (preds < preds.new_tensor(high))).all(-1),
         vote_res=0.01
     )
-    anno = anno['center']
-    gt = numpy.array([anno['x'], anno['z'], anno['y']])
-    # gt = numpy.zeros(3)
-    minrank = [999] * tops.shape[-1]
     proposals = []
     for i, cand in enumerate(nms(cands)):
-        if i == 10:
+        if i == 5:
             break
-        for icm, cm in enumerate(cms):
-            if numpy.linalg.norm(cand - gt) < cm * 0.01:
-                minrank[icm] = min(minrank[icm], i)
-        if i >= 5:
-            continue
         tree = KDTree(xyz)
         nn_idxs = tree.query_radius([cand], rad_scale + 0.01)[0]
         if len(nn_idxs) == 0:
             continue
         miou, simdf, G = registration(xyz[nn_idxs], obj_pts, return_iou=True)
-        proposals.append((miou, simdf, trimesh.transform_points(obj_pts, G), nn_idxs))
-        # proposals.append((miou, trimesh.transform_points(obj_pts, G).mean(0)))
-        
+        proposals.append((miou, simdf, trimesh.transform_points(obj_pts, G)))
     # scale_iou = numpy.ptp([x[0] for x in proposals])
     # scale_simdf = numpy.ptp([x[1] for x in proposals])
-    max_iou, max_simdf, f, nn_idxs = max(proposals, key=lambda x: x[1])
-    # max_iou, localization = max(proposals, key=lambda x: x[0])
-    print()
-    for miou, sdf, tx, _ in proposals:
-        loc = tx.mean(0)
-        print('%.2f %.2f %.2f' % (miou * 100, sdf * 100, numpy.linalg.norm(loc - gt) * 100))
-    localization = f.mean(0)
-    print('%.2f %.2f %.2f' % (max_iou * 100, max_simdf * 100, numpy.linalg.norm(localization - gt) * 100))
-    print(scene, obj_name)
-    # vis_seg_nn = numpy.zeros(len(xyz), dtype=numpy.int8)
-    # vis_seg_nn[nn_idxs] = 1
-    # trimesh.Scene([
-    #     trimesh.PointCloud(
-    #         xyz,
-    #         # colors=numpy.exp(-numpy.linalg.norm(xyz - gt, axis=-1, keepdims=True) / 0.15) * [1., 0., 0.]
-    #         colors=numpy.array([[0, 0, 0], [255, 60, 60]])[vis_seg_nn]
-    #     ),
-    #     trimesh.PointCloud(f, [0.6, 0.1, 1.0, 0.5]),
-    #     # fromto_cylinder([0, 0, 0], [0, 0, 1], [0., 0., 1., .5]),
-    #     # fromto_cylinder([0, 0, 0], [0, 1, 0], [0., 1., 0., .5]),
-    #     # fromto_cylinder([0, 0, 0], [1, 0, 0], [1., 0., 0., .5]),
-    #     # trimesh.creation.icosphere(4, radius=0.1, color=[0.8, 0.3, 0.3, 0.5]).apply_translation(gt)
-    # ]).show(line_settings={'point_size': 4})
-    for icm, cm in enumerate(cms):
-        if numpy.linalg.norm(localization - gt) < cm * 0.01:
-            accs[icm] += 1
-    for ik, k in enumerate(ks):
-        for icm, r in enumerate(minrank):
-            if r < k:
-                tops[ik, icm] += 1
+    return proposals
+
+
+def localization_metrics(proposals_collection, annotation_collection):
+    tops = numpy.zeros([len(ks), len(cms)])
+    accs = numpy.zeros([len(cms)])
+    count = 0
+    for proposals, anno in zip(proposals_collection, annotation_collection):
+        anno = anno['center']
+        gt = numpy.array([anno['x'], anno['z'], anno['y']])
+        minrank = [999] * tops.shape[-1]
+        for i, (_, _, pc) in enumerate(proposals):
+            for icm, cm in enumerate(cms):
+                if numpy.linalg.norm(pc.mean(0) - gt) < cm * 0.01:
+                    minrank[icm] = min(minrank[icm], i)
+        sorted_proposals = sorted(proposals, key=lambda x: x[1], reverse=True)
+        max_iou, max_simdf, pc = sorted_proposals[0]
+        localization = pc.mean(0)
+        # localize acc
+        for icm, cm in enumerate(cms):
+            if numpy.linalg.norm(localization - gt) < cm * 0.01:
+                accs[icm] += 1
+        # proposal recall
+        for ik, k in enumerate(ks):
+            for icm, r in enumerate(minrank):
+                if r < k:
+                    tops[ik, icm] += 1
+        count += 1
+    with open(result_fn, "a") as fo:
+        print("#Loc:", count, file=fo)
+        for ik, k in enumerate(ks):
+            for icm, cm in enumerate(cms):
+                print("%dcm@%d: %.2f" % (cm, k, tops[ik, icm] / count * 100), file=fo)
+        for icm, cm in enumerate(cms):
+            print("Acc@%dcm: %.2f" % (cm, accs[icm] / count * 100), file=fo)
+
+
+def kind_to_idx(kind):
+    if isinstance(kind, str):
+        for i, name in enumerate(class_to_obj):
+            if name.split("-")[0] == kind:
+                break
+        else:
+            raise KeyError(kind)
+        return i
+    else:
+        assert isinstance(kind, int)
+        return kind
+
+
+def detection_match(sorted_proposals, items, match_fn, th):
+    match = numpy.full(len(sorted_proposals), -1)
+    book = numpy.zeros(len(items), numpy.bool8)
+    for j, (_, _, proposal) in enumerate(sorted_proposals):
+        idx = sorted(range(len(items)), key=lambda i: match_fn(proposal, items[i]), reverse=True)
+        for i in idx:
+            if book[i]:
+                continue
+            if match_fn(proposal, items[i]) < th:
+                continue
+            book[i] = True
+            match[j] = i
+    return match
+
+
+def detection_metrics(proposals_collection, annotations_collection):
+
+    def _match_fn_cm(prop, anno):
+        anno = anno['center']
+        gt = numpy.array([anno['x'], anno['z'], anno['y']])
+        return -numpy.linalg.norm(prop[-1].mean(0) - gt)
+
+    def _match_fn_iou(prop, anno):
+        box1 = numpy.array(anno['box'])[:, [0, 2, 1]].reshape(-1)
+        box2 = trimesh.PointCloud(prop).bounds.reshape(-1)
+        return iou_3d_aabb(box1, box2)
+
+    n_cls = 15
+    cls_score_cm = [[[] for _ in range(len(cms))] for _ in range(n_cls)]
+    cls_match_cm = [[[] for _ in range(len(cms))] for _ in range(n_cls)]
+    cls_score_iou = [[[] for _ in range(len(iou_ths))] for _ in range(n_cls)]
+    cls_match_iou = [[[] for _ in range(len(iou_ths))] for _ in range(n_cls)]
+    count_cm = 0
+    count_iou = 0
+    for proposals, annos in zip(proposals_collection, annotations_collection):
+        sorted_proposals = sorted(proposals, key=lambda x: x[1], reverse=True)
+        # center-based AP
+        kind = kind_to_idx(annos[0]['kind'])
+        assert all(kind_to_idx(x['kind']) == kind for x in annos)
+        count_cm += len(annos)
+        for icm, cm in enumerate(cms):
+            match = detection_match(sorted_proposals, annos, _match_fn_cm, -cm)
+            cls_match_cm[kind][icm].append(match)
+            cls_score_cm[kind][icm].append([x[1] for x in sorted_proposals])
+        # box-based AP
+        if 'box' in annos[0]:
+            count_iou += len(annos)
+            for iiou, iou_th in enumerate(iou_ths):
+                match = detection_match(sorted_proposals, annos, _match_fn_iou, iou_th)
+                cls_match_iou[kind][iiou].append(match)
+                cls_score_iou[kind][iiou].append([x[1] for x in sorted_proposals])
+    ap_cms = numpy.zeros([n_cls, len(cms)])
+    ap_ious = numpy.zeros([n_cls, len(iou_ths)])
+    with open(result_fn, "a") as fo:
+        print("#Det [C/Box]:", count_cm, count_iou, file=fo)
+        for cidx, name in enumerate(class_to_obj[:n_cls]):
+            name = name.split("-")[0]
+            print("Class:", name, file=fo)
+            for icm, cm in enumerate(cms):
+                if len(cls_match_cm[cidx][icm]):
+                    ap_cms[cidx, icm] = compute_ap_from_matches_scores(
+                        numpy.concatenate(cls_match_cm[cidx][icm]),
+                        numpy.concatenate(cls_score_cm[cidx][icm]),
+                        [0] * count_cm
+                    )
+                else:
+                    ap_cms[cidx, icm] = numpy.nan
+                print("AP@%dcm: %.2f" % (cm, ap_cms[cidx, icm] * 100), file=fo)
+            for iiou, iou_th in enumerate(iou_ths):
+                if len(cls_match_iou[cidx][icm]):
+                    ap_ious[cidx, iiou] = compute_ap_from_matches_scores(
+                        numpy.concatenate(cls_match_iou[cidx][iiou]),
+                        numpy.concatenate(cls_score_iou[cidx][iiou]),
+                        [0] * count_iou
+                    )
+                else:
+                    ap_ious[cidx, iiou] = numpy.nan
+                print("AP%d: %.2f" % (round(iou_th * 100), ap_ious[cidx, iiou] * 100), file=fo)
+        for icm, cm in enumerate(cms):
+            print("mAP@%dcm: %.2f" % (cm, numpy.nanmean(ap_cms, 0)[icm] * 100), file=fo)
+        for iiou, iou_th in enumerate(iou_ths):
+            print("mAP%d: %.2f" % (round(iou_th * 100), numpy.nanmean(ap_ious, 0)[iiou] * 100), file=fo)
 
 # mug_001 2023-03-22/11-25-13 2023-03-20/14-23-40
 # clock_001 2023-03-19/21-27-36
@@ -315,39 +408,72 @@ class_to_obj = [
     'mug-002'
 ]
 obj_name = 'bowl-013'
-tops = numpy.zeros([3, 3])
-accs = numpy.zeros([3])
-ks = [1, 5, 10]
-cms = [5, 10, 20]
+ks = [1, 3, 5]
+cms = [1, 3, 5, 10, 20]
+iou_ths = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
 point_encoder = PointEncoder(k=30, spfcs=[32, 64, 32, 32], out_dim=32)
 ppf_encoder = PPFEncoder(ppffcs=[84, 32, 32, 16], out_dim=48)
 grids = []
 
-count = 0
-for obj_name in tqdm.tqdm(class_to_obj):
-    scene = f'scene-pcs/single-object-canonical/{obj_name}.npy'
-    with open(scene.replace('.npy', '.json')) as fi:
-        anno = json.load(fi)['items'][0]
-    run_scene(obj_name, scene, anno)
-    count += 1
-# prog = tqdm.tqdm(glob.glob('scene-pcs/**/*.npy', recursive=True))
-# for scene in prog:
-#     prog.set_description(os.path.splitext(os.path.basename(scene))[0])
+# for obj_name in tqdm.tqdm(class_to_obj):
+#     scene = f'scene-pcs/single-object-canonical/{obj_name}.npy'
 #     with open(scene.replace('.npy', '.json')) as fi:
-#         annos = json.load(fi)['items']
-#     for anno in annos:
-#         if len([x for x in annos if x['kind'] == anno['kind']]) >= 2:
-#             continue
-#         count += 1
-#         run_scene(class_to_obj[anno['kind']], scene, anno)
+#         anno = json.load(fi)['items'][0]
+#     run_scene(obj_name, scene)
 
+scene_col = []
+prog = tqdm.tqdm(glob.glob('scene-pcs/**/*.npy', recursive=True))
+# prog = tqdm.tqdm(['scene-pcs/synthetic-single/syn-1-00.npy', 'scene-pcs/multiple/bowl-mug-bowl-mug.npy'])
+for scene in prog:
+    prog.set_description(os.path.splitext(os.path.basename(scene))[0])
+    with open(scene.replace('.npy', '.json')) as fi:
+        annos = json.load(fi)['items']
+    for anno in annos:
+        try:
+            proposals = run_scene(class_to_obj[kind_to_idx(anno['kind'])], scene)
+            scene_col.append((scene, proposals, annos, anno))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+torch.save(scene_col, "scene_col.pt")
+# scene_col = torch.load("scene_col.pt")
+for section in set(os.path.dirname(scn) for scn, _, _, _ in scene_col):
+    with open(result_fn, "a") as fo:
+        print(section, file=fo)
+    loc_prop_col = []
+    loc_anno_col = []
+    det_prop_col = []
+    det_anno_col = []
+    for scene_obj in scene_col:
+        scene, proposals, annos, anno = scene_obj
+        if os.path.dirname(scene) != section:
+            continue
+        if len([x for x in annos if x['kind'] == anno['kind']]) == 1:
+            loc_prop_col.append(proposals)
+            loc_anno_col.append(anno)
+        det_prop_col.append(proposals)
+        det_anno_col.append([x for x in annos if x['kind'] == anno['kind']])
+    localization_metrics(loc_prop_col, loc_anno_col)
+    detection_metrics(det_prop_col, det_anno_col)
+    with open(result_fn, "a") as fo:
+        print(file=fo)
+with open(result_fn, "a") as fo:
+    print("Overall", file=fo)
+loc_prop_col = []
+loc_anno_col = []
+det_prop_col = []
+det_anno_col = []
+for scene_obj in scene_col:
+    scene, proposals, annos, anno = scene_obj
+    if len([x for x in annos if x['kind'] == anno['kind']]) == 1:
+        loc_prop_col.append(proposals)
+        loc_anno_col.append(anno)
+    det_prop_col.append(proposals)
+    det_anno_col.append([x for x in annos if x['kind'] == anno['kind']])
+localization_metrics(loc_prop_col, loc_anno_col)
+detection_metrics(det_prop_col, det_anno_col)
+with open(result_fn, "a") as fo:
+    print(file=fo)
 
-with open("eval_new.txt", "w") as fo:
-    print("All:", count, file=fo)
-    for ik, k in enumerate(ks):
-        for icm, cm in enumerate(cms):
-            print("%dcm@%d: %.2f" % (cm, k, tops[ik, icm] / count * 100), file=fo)
-    for icm, cm in enumerate(cms):
-        print("Acc@%dcm: %.2f" % (cm, accs[icm] / count * 100), file=fo)
-print(open("eval_new.txt").read())
+# print(open(result_fn).read())
