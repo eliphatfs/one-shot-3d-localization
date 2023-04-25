@@ -1,0 +1,11 @@
+batch_size: 1
+res: 5e-3
+max_epoch: 16
+use_normal: True
+tr_res: 24
+rot_res: 24
+regress_right: True
+
+up_sym: False
+category: 2
+shapenet_root: /home/neil/disk/ShapeNetCore.v2

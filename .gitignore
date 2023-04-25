@@ -1,0 +1,16 @@
+*.log
+*.csv
+*.txt
+__pycache__
+*.pt
+*.pth
+*.npy
+*.npz
+*.ply
+*.obj
+*.json
+*.lprof
+/opt_2
+/outputs
+/proflog
+/sunrgbdstats

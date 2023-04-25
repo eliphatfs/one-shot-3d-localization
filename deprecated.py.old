@@ -1,0 +1,34 @@
+@torch.no_grad()
+def registration_feats(pc):
+    pc_kdt = KDTree(pc)
+    knn_nbrs = pc[pc_kdt.query(pc, 30, return_distance=False)]
+    pc = torch.from_numpy(pc).cuda()
+    knn_nbrs = torch.from_numpy(knn_nbrs).cuda()
+    pcv = pc + torch.rand_like(pc) * 0.004 - 0.002
+    knn_nbrsv = knn_nbrs + torch.rand_like(knn_nbrs) * 0.004 - 0.002
+    feats = point_encoder.forward_nbrs(pcv[None], knn_nbrsv[None])
+    feats = (feats - feats.mean())
+    feats = feats / feats.std()
+    return feats.cpu().numpy()[0]
+
+
+def registration_1(pc, pc_ref):
+    G = numpy.eye(4)
+    pc_feats = registration_feats(pc)
+    pc_ref_feats = registration_feats(pc_ref)
+    pc_nor = estimate_normals(pc)
+    init_pc_ref = pc_ref
+    for it in tqdm.trange(10):
+        pc_ref_nor = estimate_normals(pc_ref)
+        scaling = (pc_ref - pc_ref.mean(0)).std()
+        cost_matrix = (
+            # ssp.distance.cdist(pc / scaling, pc_ref / scaling)
+            + 1 - abs(numpy.matmul(pc_feats, pc_ref_feats.T))
+            + 1 - abs(numpy.matmul(pc_nor, pc_ref_nor.T))
+        )
+        ri, ci = sopt.linear_sum_assignment(cost_matrix)
+        g, _, cost = trimesh.registration.procrustes(pc_ref[ci], pc[ri], scale=False)
+        G = g @ G
+        pc_ref = trimesh.transform_points(pc_ref, g)
+        print(cost)
+    return G
