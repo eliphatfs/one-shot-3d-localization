@@ -34,7 +34,7 @@ vector<int> teaser::MaxCliqueSolver::findMaxClique(teaser::Graph graph) {
   // TODO: Incorporate this to the constructor. 
   input in;
   in.algorithm = 0;
-  in.threads = 12;
+  in.threads = omp_get_max_threads();
   in.experiment = 0;
   in.lb = 0;
   in.ub = 0;
