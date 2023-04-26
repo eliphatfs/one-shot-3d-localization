@@ -7,6 +7,7 @@ import time
 import numpy
 import torch
 import open3d
+import teaserpp
 import trimesh
 import trimesh.creation
 import trimesh.registration
@@ -256,6 +257,19 @@ def run_scene(obj_name, scene):
     return proposals
 
 
+def run_scene_teaser(obj_name, scene):
+    obj_pts = numpy.load(f'data/{obj_name}.npz')['xyzn'][:, :3]
+    obj_pts -= obj_pts.mean(0)
+    xyz = numpy.load(scene).astype(numpy.float32)[:, [0, 2, 1]]
+    proposals = []
+    for i in range(5):
+        G, score = teaserpp.run_full(obj_pts, xyz, 0.01, True)
+        t_pts = trimesh.transform_points(obj_pts, G)
+        proposals.append((score, score, t_pts))
+        xyz = xyz[numpy.linalg.norm(xyz - t_pts.mean(0), axis=-1) >= 0.3]
+    return proposals
+
+
 def localization_metrics(proposals_collection, annotation_collection):
     tops = numpy.zeros([len(ks), len(cms)])
     accs = numpy.zeros([len(cms)])
@@ -465,19 +479,18 @@ scene_col = []
 prog = tqdm.tqdm(glob.glob('scene-pcs/**/*.npy', recursive=True))
 # prog = tqdm.tqdm(['scene-pcs/synthetic-single/syn-1-00.npy', 'scene-pcs/multiple/bowl-mug-bowl-mug.npy'])
 for scene in prog:
-    break
     prog.set_description(os.path.splitext(os.path.basename(scene))[0])
     with open(scene.replace('.npy', '.json')) as fi:
         annos = json.load(fi)['items']
     for anno in annos:
         try:
-            proposals = run_scene(class_to_obj[kind_to_idx(anno['kind'])], scene)
+            proposals = run_scene_teaser(class_to_obj[kind_to_idx(anno['kind'])], scene)
             scene_col.append((scene, proposals, annos, anno))
         except Exception:
             import traceback
             traceback.print_exc()
-# torch.save(scene_col, "scene_col.pt")
-scene_col = torch.load("scene_col.pt")
+torch.save(scene_col, "scene_col_teaser.pt")
+# scene_col = torch.load("scene_col_teaser.pt")
 all_metrics = []
 for section in sorted(set(os.path.dirname(scn) for scn, _, _, _ in scene_col)):
     all_metrics.append(
