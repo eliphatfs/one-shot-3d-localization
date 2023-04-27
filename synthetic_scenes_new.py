@@ -41,7 +41,7 @@ def generate_scene(fp, index_list):
     for obj in obj_list_c:
         while True:
             x, z = numpy.random.uniform(-0.37, 0.37, size=[2])
-            obj.apply_translation(numpy.array([x - obj.centroid[1], 0.005 - obj.bounds[0, 1], z - obj.centroid[2]]))
+            obj.apply_translation(numpy.array([x - obj.centroid[0], 0.005 - obj.bounds[0, 1], z - obj.centroid[2]]))
             if not collision.in_collision_single(obj):
                 break
         collision.add_object(uuid.uuid4().hex, obj.convex_hull)
