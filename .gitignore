@@ -12,7 +12,6 @@ __pycache__
 *.lprof
 /opt_2
 /outputs
-/proflog
-/sunrgbdstats
 *.xlsx
 *.dll
+/paperwork

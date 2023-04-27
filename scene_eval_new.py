@@ -100,7 +100,7 @@ def predict(xyz, rad_scale, pred_filter=None, vote_res=0.005):
         pc[point_idxs[:, 1]],
         # preds[..., 0], preds[..., 1],
         mu, nu,
-        vote_res, mass=mass
+        vote_res,  # mass=mass
     )
     return preds.cpu().numpy(), cands
 
@@ -185,6 +185,11 @@ def sim_df(pc1, pc2):
 
 
 def registration(pc, pc_ref, return_iou=False):
+    G, score = teaserpp.run_full(pc_ref, pc, 0.01, True)
+    if return_iou:
+        return score, score, G
+    else:
+        return G
     max_iou, max_simdf, max_res = -1, -1, None
     t = pc.mean(0) - pc_ref.mean(0)
     tpc = pc - t
@@ -206,8 +211,8 @@ def registration(pc, pc_ref, return_iou=False):
         G, _, cost = trimesh.registration.icp(tpc, pc_ref, Rx, scale=False)
         G = trimesh.transformations.inverse_matrix(G)
         tx = trimesh.transform_points(pc_ref, G)
-        miou = iou(tpc, tx)
-        simdf = sim_df(tpc, tx)
+        simdf = miou = iou(tpc, tx)
+        # simdf = sim_df(tpc, tx)
         # print(miou, cost)
         if simdf > max_simdf:
             max_iou = miou
@@ -484,12 +489,12 @@ for scene in prog:
         annos = json.load(fi)['items']
     for anno in annos:
         try:
-            proposals = run_scene_teaser(class_to_obj[kind_to_idx(anno['kind'])], scene)
+            proposals = run_scene(class_to_obj[kind_to_idx(anno['kind'])], scene)
             scene_col.append((scene, proposals, annos, anno))
         except Exception:
             import traceback
             traceback.print_exc()
-torch.save(scene_col, "scene_col_teaser.pt")
+torch.save(scene_col, "scene_col_ours_regscore_noweight.pt")
 # scene_col = torch.load("scene_col_teaser.pt")
 all_metrics = []
 for section in sorted(set(os.path.dirname(scn) for scn, _, _, _ in scene_col)):
